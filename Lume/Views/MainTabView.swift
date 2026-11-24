@@ -73,7 +73,7 @@ struct MainTabView: View {
         visibleTabs(in: catalogScope).showsTab(tab)
     }
 
-    /// Whether the browse UI is covered: the sync cover, downloads, the add-device sheet (not a link
+    /// Whether the browse UI is covered: downloads, the add-device sheet (not a link
     /// still waiting for it), or a playlist / profile switch. Players, paywalls and Settings (a toolbar sheet this root can't see) report themselves.
     private var hasBlockingPresentation: Bool {
         hasOwnPresentation || router.presentedCloudPairing != nil
@@ -81,10 +81,18 @@ struct MainTabView: View {
 
     /// All of the above but the add-device sheet, which waits for these to clear.
     private var hasOwnPresentation: Bool {
-        autoSyncQueue.coverPlaylist != nil
-            || showsDownloads
+        showsDownloads
             || playlistSwitch?.isSwitching == true
             || profileManager?.isSwitching == true
+    }
+
+    /// Whether a plain overlay sits over the tabs. Only tvOS layers those.
+    private var overlayOwnsScreen: Bool {
+        #if os(tvOS)
+            blockingOverlayOwnsScreen || router.isQuickSwitchPresented
+        #else
+            false
+        #endif
     }
 
     /// Hides categories (and their content) from every browse, Home and Search
@@ -105,7 +113,6 @@ struct MainTabView: View {
 
     var body: some View {
         @Bindable var router = router
-        @Bindable var autoSyncQueue = autoSyncQueue
         let scope = catalogScope
         let tabs = visibleTabs(in: scope)
         return tabView(selection: $router.selectedTab, tabs: tabs)
@@ -157,6 +164,8 @@ struct MainTabView: View {
         }
         #endif
         .task(id: playlists.count) {
+            // A deleted playlist takes its running or queued sync with it.
+            autoSyncQueue.dropSyncs(notIn: Set(playlists.map(\.id)))
             // On launch (and whenever a playlist is added) sync the active
             // playlist if it is due, plus any playlist that has never synced.
             enqueueDueSyncs(playlists)
@@ -180,9 +189,6 @@ struct MainTabView: View {
             // Coming back to `.active` also refreshes stale sports data.
             SportsSyncService.shared.isForeground = phase == .active
         }
-        .syncCover(item: $autoSyncQueue.coverPlaylist) {
-            autoSyncQueue.promoteNextIfIdle(scope: catalogScope, context: modelContext)
-        }
         .onChange(of: autoSyncQueue.isBusy, initial: true) { _, busy in
             EPGSyncService.shared.setAutoSyncQueued(busy)
         }
@@ -194,6 +200,7 @@ struct MainTabView: View {
         }
         .downloadsSheet(isPresented: $showsDownloads)
         .lumeCloudPairingSheet(router: router, rootIsCovered: hasOwnPresentation)
+        .whatsNewSheet(rootIsCovered: hasBlockingPresentation || overlayOwnsScreen)
         .switchProgressOverlay(playlist: playlistSwitch, profile: profileManager)
         // The one fire point for the rating sheet. Here rather than at the
         // eleven player presentation sites: this view is the browse root,
@@ -227,8 +234,13 @@ struct MainTabView: View {
                     // Built only while presented: a permanently mounted list of
                     // focusable rows would regrow the focus/AX responder walk
                     // that `activeOnly(_:selection:)` exists to contain.
-                    TVQuickSwitchOverlay(router: router, playlists: playlists, scope: catalogScope)
-                        .transition(.opacity)
+                    TVQuickSwitchOverlay(
+                        router: router,
+                        playlists: playlists,
+                        scope: catalogScope,
+                        autoSyncQueue: autoSyncQueue
+                    )
+                    .transition(.opacity)
                 }
             }
             .animation(.easeInOut(duration: 0.2), value: router.isQuickSwitchPresented)
@@ -285,7 +297,35 @@ struct MainTabView: View {
                 } label: {
                     Image(systemName: "gear")
                 }
+
+                syncTab(selection: selection.wrappedValue)
             }
+        }
+
+        @TabContentBuilder<AppTab>
+        private func syncTab(selection: AppTab) -> some TabContent<AppTab> {
+            if showsSyncTab(selection: selection) {
+                Tab(value: AppTab.sync) {
+                    activeOnly(.sync, selection: selection) {
+                        SyncActivityView(onClose: { router.selectedTab = .home })
+                    }
+                } label: {
+                    Image(systemName: autoSyncQueue.recentFailure() == nil
+                        ? "arrow.triangle.2.circlepath"
+                        : "exclamationmark.arrow.triangle.2.circlepath")
+                        .accessibilityLabel(Text("Sync"))
+                }
+            }
+        }
+
+        /// tvOS has no library toolbar to carry the sync indicator, so a sync
+        /// that is running, waiting or has just failed gets a tab of its own
+        /// at the end of the bar: the system lays it out, in any language, and
+        /// the remote reaches it like every other tab. It stays while it is
+        /// selected, so a sync finishing under the viewer doesn't pull the
+        /// screen away.
+        private func showsSyncTab(selection: AppTab) -> Bool {
+            selection == .sync || autoSyncQueue.isBusy || autoSyncQueue.recentFailure() != nil
         }
 
         /// Whether something layered over the tabs owns the screen: tvOS focus is
@@ -295,7 +335,6 @@ struct MainTabView: View {
         /// it would move focus and hand it back somewhere else.
         private var blockingOverlayOwnsScreen: Bool {
             router.isMultiViewPresented
-                || autoSyncQueue.coverPlaylist != nil
                 || profileManager?.isSwitching == true
         }
 
@@ -524,27 +563,6 @@ private extension View {
                 // height, leaving the sheet rendering as a bare toolbar.
                 .frame(minWidth: 480, minHeight: 440)
                 #endif
-            }
-        #endif
-    }
-}
-
-// MARK: - Sync cover presentation
-
-private extension View {
-    /// Presents the auto-sync progress UI as a blocking cover: a full-screen
-    /// cover on iOS/tvOS (no swipe-to-dismiss), a sheet on macOS where
-    /// `fullScreenCover` is unavailable.
-    @ViewBuilder
-    func syncCover(item: Binding<Playlist?>, onDismiss: @escaping () -> Void) -> some View {
-        #if os(macOS)
-            sheet(item: item, onDismiss: onDismiss) { playlist in
-                SyncProgressView(playlist: playlist, autoStart: true)
-                    .frame(minWidth: 420, minHeight: 480)
-            }
-        #else
-            fullScreenCover(item: item, onDismiss: onDismiss) { playlist in
-                SyncProgressView(playlist: playlist, autoStart: true)
             }
         #endif
     }
